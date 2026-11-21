@@ -1,37 +1,120 @@
-name: Build APK
+name: Build APK (stable signing)
+
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Unzip project
-      run: |
-        unzip -o Svyazka.zip
-        rm Svyazka.zip
-        
-    - name: set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
-        
-    - name: Build with Gradle
-      run: |
-        # Этот скрипт сам найдет папку, где лежит gradlew, и зайдет в нее
-        DIR=$(find . -name gradlew -type f -exec dirname {} \; | head -n 1)
-        cd $DIR
-        chmod +x ./gradlew
-        ./gradlew assembleDebug
-        
-    - name: Upload APK
-      uses: actions/upload-artifact@v4
-      with:
-        name: app-debug
-        # Ищет APK во всех папках на всякий случай
-        path: '**/build/outputs/apk/debug/*.apk'
+      - name: Download sources
+        uses: actions/checkout@v4
+
+      - name: Extract Nexus AI project
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -q -o Svyazka.zip
+          test -f NexusIA/gradlew || { echo "Missing NexusIA/gradlew"; exit 1; }
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Restore permanent signing identity
+        env:
+          NEXUS_SIGNING_BUNDLE: ${{ secrets.NEXUS_SIGNING_BUNDLE }}
+        run: |
+          python3 - <<'PYTHON'
+          import base64, io, os, pathlib, sys, zipfile
+          secret = os.getenv('NEXUS_SIGNING_BUNDLE', '').strip()
+          if not secret:
+              sys.exit('Missing repository secret NEXUS_SIGNING_BUNDLE. Refusing unsigned APK.')
+          try:
+              bundle = base64.b64decode(secret, validate=True)
+              with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
+                  if set(archive.namelist()) != {'signing.p12', 'signing.pass'}:
+                      sys.exit('Unexpected signing bundle files')
+                  content = {name: archive.read(name) for name in ('signing.p12', 'signing.pass')}
+              if not content['signing.p12'] or not content['signing.pass']:
+                  sys.exit('Incomplete signing bundle')
+          except (ValueError, zipfile.BadZipFile) as exc:
+              sys.exit(f'Invalid signing bundle: {exc}')
+          directory = pathlib.Path('NexusIA/build/manual')
+          directory.mkdir(parents=True, exist_ok=True)
+          for name, data in content.items():
+              destination = directory / name
+              destination.write_bytes(data)
+              destination.chmod(0o600)
+          print('Permanent signing credentials restored (values hidden).')
+          PYTHON
+
+      - name: Verify signing certificate identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          signing_dir="NexusIA/build/manual"
+          actual="$(keytool -exportcert -alias svyazka -storetype PKCS12 \
+            -keystore "$signing_dir/signing.p12" \
+            -storepass "$(cat "$signing_dir/signing.pass")" | sha256sum | cut -d' ' -f1)"
+          expected="658cb57254d29e79bd74c099dd3246b8715554ec6a4f2fdef863ef767c8a712a"
+          if [ "$actual" != "$expected" ]; then
+            echo 'Signing certificate differs from the original stable certificate. Stopping.'
+            exit 1
+          fi
+          echo "Verified permanent signer SHA-256: $actual"
+
+      - name: Increase version code on every new build
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os, pathlib, re, sys
+          path = pathlib.Path('NexusIA/app/build.gradle')
+          text = path.read_text(encoding='utf-8')
+          run_number = int(os.environ['GITHUB_RUN_NUMBER'])
+          version = 10000 + run_number
+          def replace(match):
+              return match.group(1) + str(max(version, int(match.group(2))))
+          updated, count = re.subn(r'(?m)^(\s*versionCode\s+)(\d+)\s*$', replace, text)
+          if count != 1:
+              sys.exit('Cannot find a single versionCode in app/build.gradle')
+          path.write_text(updated, encoding='utf-8')
+          print(f'APK versionCode: {version}')
+          PYTHON
+
+      - name: Build signed APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd NexusIA
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Verify APK is signed by permanent certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='NexusIA/app/build/outputs/apk/debug/app-debug.apk'
+          test -f "$apk"
+          apksigner="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          test -n "$apksigner" || { echo 'apksigner missing'; exit 1; }
+          "$apksigner" verify --print-certs "$apk" > /tmp/nexus-apk-signature.txt
+          grep -Fiq '658cb57254d29e79bd74c099dd3246b8715554ec6a4f2fdef863ef767c8a712a' /tmp/nexus-apk-signature.txt || {
+            echo 'APK signer does not match permanent certificate.'
+            exit 1
+          }
+          echo 'APK signed and verified with permanent certificate.'
+
+      - name: Publish APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nexus-AI-signed
+          path: NexusIA/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

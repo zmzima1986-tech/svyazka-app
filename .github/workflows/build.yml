@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# Do not let two builds of the same branch publish indistinguishable updates.
+concurrency:
+  group: nexus-signed-apk-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -71,22 +76,34 @@ jobs:
           fi
           echo "Verified permanent signer SHA-256: $actual"
 
-      - name: Increase version code on every new build
+      - name: Assign increasing version code to every APK build
         shell: bash
         run: |
           python3 - <<'PYTHON'
+          from datetime import datetime, timezone
           import os, pathlib, re, sys
+
           path = pathlib.Path('NexusIA/app/build.gradle')
-          text = path.read_text(encoding='utf-8')
-          run_number = int(os.environ['GITHUB_RUN_NUMBER'])
-          version = 10000 + run_number
-          def replace(match):
-              return match.group(1) + str(max(version, int(match.group(2))))
-          updated, count = re.subn(r'(?m)^(\s*versionCode\s+)(\d+)\s*$', replace, text)
-          if count != 1:
-              sys.exit('Cannot find a single versionCode in app/build.gradle')
-          path.write_text(updated, encoding='utf-8')
-          print(f'APK versionCode: {version}')
+          contents = path.read_text(encoding='utf-8')
+          pattern = r'(?m)^(\s*versionCode\s+)(\d+)\s*$'
+          matches = list(re.finditer(pattern, contents))
+          if len(matches) != 1:
+              sys.exit('Cannot find exactly one versionCode in app/build.gradle')
+
+          # GITHUB_RUN_NUMBER stays unchanged on reruns; use build time instead.
+          # Seconds since 2020 fit Android's versionCode limit for decades.
+          epoch = datetime(2020, 1, 1, tzinfo=timezone.utc)
+          time_based_code = 100_000 + int((datetime.now(timezone.utc) - epoch).total_seconds())
+          source_code = int(matches[0].group(2))
+          version_code = max(time_based_code, source_code + 1)
+          if not 1 <= version_code <= 2_100_000_000:
+              sys.exit('versionCode is outside Android supported range')
+
+          contents = re.sub(pattern, lambda match: match.group(1) + str(version_code), contents)
+          path.write_text(contents, encoding='utf-8')
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env_file:
+              env_file.write(f'APK_VERSION_CODE={version_code}\n')
+          print(f'APK versionCode: {version_code} (source: {source_code})')
           PYTHON
 
       - name: Build signed APK
@@ -96,6 +113,22 @@ jobs:
           cd NexusIA
           chmod +x ./gradlew
           ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Verify built APK version code
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='NexusIA/app/build/outputs/apk/debug/app-debug.apk'
+          test -f "$apk"
+          aapt="$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+          test -n "$aapt" || { echo 'Android aapt is missing'; exit 1; }
+          "$aapt" dump badging "$apk" > /tmp/nexus-apk-badging.txt
+          grep '^package:' /tmp/nexus-apk-badging.txt
+          grep -Eq "^package: name='app.svyazka.team' versionCode='${APK_VERSION_CODE}'" /tmp/nexus-apk-badging.txt || {
+            echo "Built APK versionCode differs from expected ${APK_VERSION_CODE}. Stopping."
+            exit 1
+          }
+          echo "Built APK versionCode verified: ${APK_VERSION_CODE}"
 
       - name: Verify APK is signed by permanent certificate
         shell: bash
@@ -115,6 +148,6 @@ jobs:
       - name: Publish APK
         uses: actions/upload-artifact@v4
         with:
-          name: Nexus-AI-signed
+          name: Nexus-AI-signed-v${{ env.APK_VERSION_CODE }}
           path: NexusIA/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

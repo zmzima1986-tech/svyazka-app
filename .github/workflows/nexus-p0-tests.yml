@@ -36,27 +36,71 @@ jobs:
           fi
           test -f p0-source/scripts/run-android-p0-ci.sh
       - uses: actions/setup-java@v4
+        id: java
         with:
           distribution: temurin
           java-version: '17'
       - uses: actions/setup-node@v4
+        id: node
         with:
           node-version: '22'
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: '3.12'
       - name: Verify source integrity
+        id: integrity
         run: python3 -B scripts/check-source-integrity.py
-      - name: Python regressions and translations
-        run: python3 -B -m unittest discover -s tests && python3 -B scripts/check-resources.py
+      - name: Python regressions
+        id: python_regression
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' && steps.python.outcome == 'success' }}
+        shell: bash
+        run: |
+          mkdir -p build/p0-evidence/local
+          python3 -B -m unittest discover -s tests 2>&1 | tee build/p0-evidence/local/python_regression.log
+      - name: Translations
+        id: translations
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' && steps.python.outcome == 'success' }}
+        shell: bash
+        run: |
+          mkdir -p build/p0-evidence/local
+          python3 -B scripts/check-resources.py 2>&1 | tee build/p0-evidence/local/translations.log
       - name: JVM contracts
-        run: bash scripts/test-jvm.sh
+        id: jvm
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' && steps.java.outcome == 'success' }}
+        shell: bash
+        run: |
+          mkdir -p build/p0-evidence/local
+          bash scripts/test-jvm.sh 2>&1 | tee build/p0-evidence/local/jvm.log
       - name: Pyodide worker
-        run: node tests/test-python-worker.mjs
+        id: pyodide
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' && steps.java.outcome == 'success' && steps.node.outcome == 'success' }}
+        shell: bash
+        run: |
+          mkdir -p build/p0-evidence/local
+          node tests/test-python-worker.mjs 2>&1 | tee build/p0-evidence/local/pyodide.log
       - name: Install browser test dependencies
-        run: python3 -m pip install playwright==1.62.0 && python3 -m playwright install --with-deps chromium
+        id: browser_setup
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' && steps.python.outcome == 'success' }}
+        shell: bash
+        run: |
+          mkdir -p build/p0-evidence/local
+          (python3 -m pip install playwright==1.62.0 && python3 -m playwright install --with-deps chromium) 2>&1 | tee build/p0-evidence/local/browser_setup.log
       - name: Chromium regression
-        run: python3 -B scripts/test-web-preview.py
+        id: chromium
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' && steps.python.outcome == 'success' && steps.browser_setup.outcome == 'success' }}
+        shell: bash
+        run: |
+          mkdir -p build/p0-evidence/local
+          python3 -B scripts/test-web-preview.py 2>&1 | tee build/p0-evidence/local/chromium.log
+      - name: Upload local test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-p0-local-reports
+          path: p0-source/build/p0-evidence/local/
+          if-no-files-found: warn
+          retention-days: 7
 
   android-regression:
     runs-on: ubuntu-latest
@@ -94,25 +138,53 @@ jobs:
           fi
           test -f p0-source/scripts/run-android-p0-ci.sh
       - uses: actions/setup-java@v4
+        id: java
         with:
           distribution: temurin
           java-version: '17'
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: '3.12'
       - name: Verify source integrity
+        id: integrity
         run: python3 -B scripts/check-source-integrity.py
       - uses: android-actions/setup-android@v3
-      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
-      - name: Build debug and test APKs, run JVM and lint
-        run: bash ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
+        id: android_sdk
+        with:
+          packages: 'platform-tools'
+      - name: Install required Android SDK packages
+        id: sdk_packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: Build debug and test APKs
+        id: build_apks
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' && steps.java.outcome == 'success' && steps.sdk_packages.outcome == 'success' }}
+        shell: bash
+        run: |
+          mkdir -p build/p0-evidence
+          bash ./gradlew --no-daemon assembleDebug assembleDebugAndroidTest 2>&1 | tee build/p0-evidence/build-apks.log
+      - name: Android JVM unit tests
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' && steps.java.outcome == 'success' && steps.sdk_packages.outcome == 'success' }}
+        shell: bash
+        run: |
+          mkdir -p build/p0-evidence
+          bash ./gradlew --no-daemon testDebugUnitTest 2>&1 | tee build/p0-evidence/gradle-unit.log
+      - name: Android lint
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' && steps.java.outcome == 'success' && steps.sdk_packages.outcome == 'success' }}
+        shell: bash
+        run: |
+          mkdir -p build/p0-evidence
+          bash ./gradlew --no-daemon lintDebug 2>&1 | tee build/p0-evidence/lint.log
       - name: Enable KVM for Android emulator
+        id: kvm
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' && steps.build_apks.outcome == 'success' }}
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           test -r /dev/kvm && test -w /dev/kvm
       - name: Run real Android probes
+        if: ${{ !cancelled() && steps.integrity.outcome == 'success' && steps.build_apks.outcome == 'success' && steps.kvm.outcome == 'success' }}
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: ${{ matrix.api }}

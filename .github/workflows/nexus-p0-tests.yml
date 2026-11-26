@@ -1,0 +1,133 @@
+name: Nexus P0 Tests
+
+# Repository wrapper for Svyazka.zip uploads. No signing or release publication.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  local-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: p0-source
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Extract uploaded project ZIP
+        working-directory: .
+        run: |
+          set -euo pipefail
+          test -f Svyazka.zip
+          unzip -tq Svyazka.zip
+          mkdir p0-input
+          unzip -q Svyazka.zip -d p0-input
+          if [[ -f p0-input/NexusIA/gradlew ]]; then
+            mv p0-input/NexusIA p0-source
+          elif [[ -f p0-input/gradlew ]]; then
+            mv p0-input p0-source
+          else
+            echo 'Project root not found in Svyazka.zip' >&2
+            exit 1
+          fi
+          test -f p0-source/scripts/run-android-p0-ci.sh
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify source integrity
+        run: python3 -B scripts/check-source-integrity.py
+      - name: Python regressions and translations
+        run: python3 -B -m unittest discover -s tests && python3 -B scripts/check-resources.py
+      - name: JVM contracts
+        run: bash scripts/test-jvm.sh
+      - name: Pyodide worker
+        run: node tests/test-python-worker.mjs
+      - name: Install browser test dependencies
+        run: python3 -m pip install playwright==1.62.0 && python3 -m playwright install --with-deps chromium
+      - name: Chromium regression
+        run: python3 -B scripts/test-web-preview.py
+
+  android-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - api: 35
+            runs: 3
+          - api: 30
+            runs: 1
+    defaults:
+      run:
+        working-directory: p0-source
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Extract uploaded project ZIP
+        working-directory: .
+        run: |
+          set -euo pipefail
+          test -f Svyazka.zip
+          unzip -tq Svyazka.zip
+          mkdir p0-input
+          unzip -q Svyazka.zip -d p0-input
+          if [[ -f p0-input/NexusIA/gradlew ]]; then
+            mv p0-input/NexusIA p0-source
+          elif [[ -f p0-input/gradlew ]]; then
+            mv p0-input p0-source
+          else
+            echo 'Project root not found in Svyazka.zip' >&2
+            exit 1
+          fi
+          test -f p0-source/scripts/run-android-p0-ci.sh
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify source integrity
+        run: python3 -B scripts/check-source-integrity.py
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: Build debug and test APKs, run JVM and lint
+        run: bash ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
+      - name: Enable KVM for Android emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+      - name: Run real Android probes
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api }}
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          script: cd p0-source && mkdir -p build/p0-evidence && sha256sum ../Svyazka.zip > build/p0-evidence/source-zip-sha256.txt && bash scripts/run-android-p0-ci.sh ${{ matrix.runs }}
+      - name: Upload reports even when tests fail
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-p0-api-${{ matrix.api }}-reports
+          path: |
+            p0-source/build/p0-evidence/
+            p0-source/app/build/test-results/testDebugUnitTest/
+            p0-source/app/build/reports/lint-results-debug.*
+          if-no-files-found: warn
+          retention-days: 7
